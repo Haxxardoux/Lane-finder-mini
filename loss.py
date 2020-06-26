@@ -6,18 +6,14 @@ from torch import nn
 
 
 class ConstrastiveLoss(nn.Module):
-    def __init__(self, temperature=1.5):
+    def __init__(self, device, temperature=1.5):
         super(ConstrastiveLoss, self).__init__()
         self.temperature = temperature
-
+        self.device = device
     def forward(self, pos_tensor, neg_tensor):
-
-        self.pos_tensor = torch.cat(pos_tensor, dim=0)
-        self.neg_tensor = torch.cat(neg_tensor, dim=0)
-        if self.pos_tensor.is_cuda:
-            device = 'cuda:0'
-        else:
-            device = 'cpu'
+        
+        self.pos_tensor = pos_tensor
+        self.neg_tensor = neg_tensor
 
         # normalize, because i have trust issues
         # ^ actually, normalizing turned out to be really important, it should be done here and not in the pipeline
@@ -34,7 +30,7 @@ class ConstrastiveLoss(nn.Module):
         # this computes the inner product of Zi and Zj where i != j, and i is the anchor, and j are other positive samples
         # the diagonal of the output matrix will be the inner product of i and i, so we remove it by making a mask with torch.eye
         # we also exponentiate and sum. 
-        eye = torch.eye(len(self.pos_tensor), dtype = torch.bool).to(device)
+        eye = torch.eye(len(self.pos_tensor), dtype = torch.bool).to(self.device)
 
         Sum_E_Zi_Zj = torch.sum(
             torch.exp(torch.div(

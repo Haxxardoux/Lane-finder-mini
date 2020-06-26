@@ -1,21 +1,27 @@
-import cv2
-from torch.utils.data import Dataset
-import torch.nn.functional as F
 import torch
+import numpy as np
+import torch.nn.functional as F
+import cv2
 
-class vidSet(Dataset):
+class vidSet(torch.utils.data.Dataset):
     def __init__(self, video_paths):
-        self.video_paths = video_paths
 
+        self.video_paths = video_paths
         self.caps = [cv2.VideoCapture(video_path) for video_path in self.video_paths]
-        self.images = [[capid, framenum] for capid, cap in enumerate(self.caps) for framenum in range(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)-15))]    
-        print(self.images)
+        self.images = np.array([[capid, framenum] for capid, cap in enumerate(self.caps) for framenum in range(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))])[0::20]
+        self.images2 = np.array([[capid, framenum] for capid, cap in enumerate(self.caps) for framenum in range(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))])[1::20]
+        
+        if self.images.shape != self.images.shape:
+            self.images = self.images[:-1]
+        
+        self.ret = np.hstack((self.images, self.images2))
+        self.ret = self.ret.reshape(self.ret.shape[0]*2, 2)
 
     def __len__(self):
-         return len(self.images)
+         return len(self.ret)
 
     def __getitem__(self, idx):
-        capid, framenum = self.images[idx]
+        capid, framenum = self.ret[idx]
         cap = self.caps[capid]
         cap.set(cv2.CAP_PROP_POS_FRAMES, framenum)
         res, frame = cap.read()
@@ -26,19 +32,4 @@ class vidSet(Dataset):
         img_tensor = F.interpolate(img_tensor, scale_factor=(0.4, 0.4))
 
         return img_tensor.squeeze()
-
-if __name__ == "__main__":
-    import os 
-
-    videos_path = 'C:\\Users\\turbo\\Python projects\\Lane finder\\data\\videos\\test'
-
-    path_list = []
-    for (dirpath, _, filenames) in os.walk(videos_path):
-        for filename in filenames:
-            path_list.append(os.path.abspath(os.path.join(videos_path, filename)))
-
-    vidSet(path_list[:2])
-
-
-
 
