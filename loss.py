@@ -10,7 +10,10 @@ class ConstrastiveLoss(nn.Module):
         super(ConstrastiveLoss, self).__init__()
         self.temperature = temperature
         self.device = device
+<<<<<<< HEAD
         
+=======
+>>>>>>> 68158a80eb37179d249edf230538b9f647159d7d
     def forward(self, pos_tensor, neg_tensor):
         
         self.pos_tensor = pos_tensor
