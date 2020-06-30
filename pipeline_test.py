@@ -1,145 +1,126 @@
-import torch
-from torch.utils.data import DataLoader
-import mlflow
-from time import time
-import hiddenlayer as HL
+import argparse
+import sys
 import os
-import cv2
 
-# i made all of these !
-from models import Backbone as Model
-from video_loader import vidSet
-from utils import Params, count_parameters
-from loss import ConstrastiveLoss
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader
 
-# mlflow command
-# mlflow ui --backend-store-uri Logs &
+from torchvision import datasets, transforms, utils
 
+from tqdm import tqdm
+import mlflow
 
-videos_path = 'C:\\Users\\turbo\\Python projects\\Lane finder\\data\\videos\\test'
+from VQVAE import VQVAE
+import distributed as dist
 
-path_list = []
-for (dirpath, _, filenames) in os.walk(videos_path):
-    for filename in filenames:
-        path_list.append(os.path.abspath(os.path.join(videos_path, filename)))
+class Params(object):
+    def __init__(self, batch_size, epochs, lr, size):
+        self.size = batch_size
+        self.epoch = epochs
+        self.lr = lr
+        self.size = size
 
-# takes a list of file paths to .mp4s and returns a dataloader ov the frames
-vidset_train = vidSet(path_list[:2])
+args = Params(64, 1000, 0.0005, 256)
 
-# we want a class for our parameters because it is wayyyy easier to log them this way 
-args = Params(1, 1, 0.00005)
+def train(epoch, loader, model, optimizer, device):
+    if dist.is_primary():
+        loader = tqdm(loader)
 
-vidloader_train = DataLoader(vidset_train, batch_size=args.batch_size, shuffle=False)
+    criterion = nn.MSELoss()
 
-# set the file path where the logs will be stored. this should be a global reference since many different scripts will reference it from different directories
-mlflow.tracking.set_tracking_uri('file:\\Users\\turbo\\Python projects\\Lane finder\\Logs')
+    latent_loss_weight = 0.25
+    sample_size = 25
 
-# a new experiment will be created if one by that name does not already exists
-mlflow.set_experiment('Constrastive loss unsupervised')
+    mse_sum = 0
+    mse_n = 0
 
-device = 'cuda:0'
+    for i, (img, label) in enumerate(loader):
+        model.zero_grad()
 
-# requires a custom training loop. if you are reading this and see that i use custom training loops in all my code, it is because as of right now,
-# i really hope i can stop doing that and make my life easier. if you see custom training loops elsewhere, take pleasure in knowing that i failed, and i probably forgot 
-def train(model, train_data, loss, optimizer):
+        img = img.to(device)
 
-    for epoch in range(args.epochs):
-        t0 = time()
-        train_loss = 0
+        out, latent_loss = model(img)
+        recon_loss = criterion(out, img)
+        latent_loss = latent_loss.mean()
+        loss = recon_loss + latent_loss_weight * latent_loss
+        loss.backward()
 
-        # this will be a tensor of 15 latent vectors corresponding to 15 successive video frames, which will sit in GPU memory and be used to compute loss
-        # the issue is the latent vectors should change with training, and the only way to account for this is to re-compute them, but we ignore this!
-        # we need to accumulate some latent vectors in memory. i think that if you start training with a decent model, or use a low lr, this is ok
-        # how dare you point out an obvious flaw in my method!
+        optimizer.step()
 
-        # torch.cat is too memory intensive - it creates copies, so we have to use a list instead
-        # but this means we now have to transfer our latent tensor to GPU/host all the god damn time
-        # :(
+        mse_sum += recon_loss.item() * img.shape[0]
+        mse_n += img.shape[0]
 
-        # see above ^ not in use currently
-        # latent_tensor = torch.zeros(15, 128).to(device).requires_grad_()
-        latent_tensor = []
+        if dist.is_primary():
+            lr = optimizer.param_groups[0]["lr"]
 
-        for batch_idx, img in enumerate(train_data):
-
-            # set parameter gradients to zero 
-            optimizer.zero_grad()
+            loader.set_description(
+                (
+                    f"epoch: {epoch + 1}; mse: {recon_loss.item():.5f}; "
+                    f"latent: {latent_loss.item():.3f}; avg mse: {mse_sum / mse_n:.5f}; "
+                    f"lr: {lr:.5f}"
+                )
+            )
             
-            # take new observation to the gpu
-            img_gpu = img.to(device)
+        if i % 20 == 0:
+            model.eval()
 
-            # concatenate the latent representation of the image with the latent tensor residing in GPU memory
-            print('batch number: ', batch_idx)
-            if batch_idx < 2:
-                # not in use see above paragraph
-                # latent_tensor = torch.cat( (latent_tensor[1:], model(img_gpu)), dim=0)
+            sample = img[:sample_size]
 
-                # list instead, no drop op yet because we wait until we have 15 observations
-                with torch.no_grad():
-                    latent_vector = model(img_gpu)
-                    latent_tensor.append(latent_vector)
-                    print('no grad tensor shpae', latent_tensor[0].shape)
-                    continue 
-            else:
-                # not in use, see above paragraph
-                # latent_tensor = torch.cat( (latent_tensor[1:], model(img_gpu)), dim=0)
+            with torch.no_grad():
+                out, _ = model(sample)
 
-                # list instead
-                latent_vector = model(img_gpu)
-                latent_tensor.append(latent_vector)
-                del latent_tensor[0]
-                print('requires grad tensor shape', latent_tensor[0].shape)
+            utils.save_image(
+                torch.cat([sample, out], 0),
+                f"samples/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}.jpg",
+                nrow=sample_size,
+                normalize=True,
+                range=(-1, 1),
+            )
 
+            model.train()
 
-            # Computation of the cost 
-            # first argument is positive tensor and second argument is negative tensor, although it may not matter?
-            # most recent ( [-1] ) observation in latent tensor is most recent, aka the "anchor" in the case of triplet loss
+        return {'Latent Loss':latent_loss.item(), 'Average MSE':mse_sum/mse_n, 'Reconstruction Loss':recon_loss.item()}
 
-            # the 2 here (in both cases) corresponds to the number of positives/negatives. [-1] is the anchor, [-2:] is one anchor and one positive 
-            cost = loss(latent_tensor[-2:], latent_tensor[:2])
+    
+device = "cuda:0"
 
-            # Backward propagation
-            cost.backward(retain_graph=True)  # <= compute the gradients
+mlflow.tracking.set_tracking_uri('file:/share/lazy/will/ConstrastiveLoss/Logs')
 
-            # Update parameters (weights and biais)
-            optimizer.step()
+mlflow.set_experiment('Vector Quantized Variational Autoencider')
 
-            # hardcoded batch size :( compute the train loss 
+transform = transforms.Compose([
+        transforms.Resize(args.size),
+        transforms.CenterCrop(args.size),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
 
-            train_loss += cost.item()
-        t1 = time()
+dataset = datasets.ImageFolder('/data/home/will/Lane-finder-mini/', transform=transform)
+# sampler = dist.data_sampler(dataset, shuffle=True, distributed=False)
+loader = DataLoader(dataset, batch_size=128, shuffle=True)
 
-        
-        ret = {'Train Loss':train_loss, 'Epoch time':t1-t0}
-        yield ret.items()
+model = VQVAE().to(device)
 
+optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-
-model = Model().to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr = args.lr)
-criterion = ConstrastiveLoss()
-run_name = 'delete'
+run_name = 'VQVAE 2 on comma10k (3k)'
 with mlflow.start_run(run_name = run_name) as run:
+
     for key, value in vars(args).items():
         mlflow.log_param(key, value)
 
-    mlflow.log_param('Parameters', count_parameters(model))
+    mlflow.log_param('Parameters', sum(p.numel() for p in model.parameters() if p.requires_grad))
 
-    for epoch, items in enumerate(train(model, vidloader_train, criterion, optimizer)):
-        for key, value in items:
-            print('Epoch: ', epoch)
+    for epoch in range(args.epoch):
+        results = train(epoch, loader, model, optimizer, device)
+        for key, value in results.items():
             print(key, value)
             mlflow.log_metric(key, value, epoch)
 
-        torch.save({
-            'model':model.state_dict(),
-            'optimizer':optimizer.state_dict(),
-            }, str(epoch)+'run_stats.pyt')
-        mlflow.log_artifact(str(epoch)+'run_stats.pyt')
+            torch.save({
+    'model':model.state_dict(),
+    'optimizer':optimizer.state_dict(),
+    }, 'run_stats.pyt')
+    mlflow.log_artifact('run_stats.pyt')
 
-
-    # torch.cuda.empty_cache()
-    # # save an architecture diagram
-    # HL.transforms.Fold("Conv > BatchNorm > Relu", "ConvBnRelu"),
-    # HL.build_graph(model, torch.zeros([args.batch_size, 3, 288, 512]).to(device)).save('architecture', format='png')
-    # mlflow.log_artifact('architecture.png')

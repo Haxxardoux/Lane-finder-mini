@@ -1,0 +1,15 @@
+artifact_uri: file:///data/home/will/Lane-finder-mini/VQVAE/mlruns/0/e39803d536774189873e12b796d838de/artifacts
+end_time: 1593246616437
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+name: ''
+run_id: e39803d536774189873e12b796d838de
+run_uuid: e39803d536774189873e12b796d838de
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1593246579788
+status: 3
+tags: []
+user_id: will
