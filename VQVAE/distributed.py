@@ -14,7 +14,7 @@ def is_primary():
 
 
 def get_rank():
-    if not dist.is_available():
+    if not torch.distributed.dist.is_available():
         return 0
 
     if not dist.is_initialized():
@@ -24,7 +24,7 @@ def get_rank():
 
 
 def get_local_rank():
-    if not dist.is_available():
+    if not torch.distributed.dist.is_available():
         return 0
 
     if not dist.is_initialized():
@@ -37,7 +37,7 @@ def get_local_rank():
 
 
 def synchronize():
-    if not dist.is_available():
+    if not torch.distributed.dist.is_available():
         return
 
     if not dist.is_initialized():
@@ -52,7 +52,7 @@ def synchronize():
 
 
 def get_world_size():
-    if not dist.is_available():
+    if not torch.distributed.dist.is_available():
         return 1
 
     if not dist.is_initialized():
