@@ -1,13 +1,9 @@
 import torch
 from torch import nn
-from torch.nn import functional as F
-
-import distributed as dist_fn
-
-
-
-# Borrowed from https://github.com/deepmind/sonnet and ported it to PyTorch
-
+from torchsummary import summary
+import torch.nn.functional as F
+import mlflow
+from torchvision import transforms
 
 class Quantize(nn.Module):
     def __init__(self, dim, n_embed, decay=0.99, eps=1e-5):
@@ -39,8 +35,8 @@ class Quantize(nn.Module):
             embed_onehot_sum = embed_onehot.sum(0)
             embed_sum = flatten.transpose(0, 1) @ embed_onehot
 
-            dist_fn.all_reduce(embed_onehot_sum)
-            dist_fn.all_reduce(embed_sum)
+            torch.sum(embed_onehot_sum)
+            torch.sum(embed_sum)
 
             self.cluster_size.data.mul_(self.decay).add_(
                 embed_onehot_sum, alpha=1 - self.decay
@@ -63,82 +59,70 @@ class Quantize(nn.Module):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, in_channel, channel):
+    def __init__(self, in_channel, out_channel, stride=1, kernel_size=3, extra_layers=1, residual=True):
         super().__init__()
+        self.residual=residual
+        
+        layers = [
+            nn.Conv2d(in_channel, out_channel, stride=stride, kernel_size=kernel_size, padding=(kernel_size-1)//2),
+            nn.BatchNorm2d(out_channel),
+            nn.ReLU()]
+        
+        extra_block = [
+            nn.Conv2d(out_channel, out_channel, stride=1, kernel_size=3, padding=(3-1)//2),
+            nn.BatchNorm2d(out_channel),
+            nn.ReLU()]
 
-        self.conv = nn.Sequential(
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channel, channel, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channel, in_channel, 1),
-        )
+        layers.extend(extra_block)
+
+        self.resblock = nn.Sequential(*layers)
 
     def forward(self, input):
-        out = self.conv(input)
-        out += input
-
-        return out
-
+        if self.residual:
+            out = self.resblock(input)
+            out = input+out
+            return out
+        else:
+            out = self.resblock(input)
+            return out
 
 class Encoder(nn.Module):
-    def __init__(self, in_channel, channel, n_res_block, n_res_channel, stride):
+    def __init__(self, in_channel, channel, extra_layers, stride, kernel_size, residual, extra_residual_blocks, downsample):
         super().__init__()
 
-        if stride == 4:
-            blocks = [
-                nn.Conv2d(in_channel, channel // 2, 4, stride=2, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(channel // 2, channel, 4, stride=2, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(channel, channel, 3, padding=1),
-            ]
+        self.out_channels = channel
 
-        elif stride == 2:
-            blocks = [
-                nn.Conv2d(in_channel, channel // 2, 4, stride=2, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(channel // 2, channel, 3, padding=1),
-            ]
+        blocks = [
+            ResBlock(in_channel, channel, extra_layers=extra_layers, stride=stride, residual=residual),
+            nn.ReLU(inplace=True)
+        ]
 
-        for i in range(n_res_block):
-            blocks.append(ResBlock(channel, n_res_channel))
 
-        blocks.append(nn.ReLU(inplace=True))
+        for i in range(extra_residual_blocks):
+            blocks.append(ResBlock(in_channel=channel, out_channel=channel, extra_layers=extra_layers, residual=True))
+            if (downsample=='Once') & (i==0):
+                blocks.append(nn.MaxPool2d(2, 2))
+            if (downsample=='Twice') & ((i==0) | (i==1)):
+                blocks.append(nn.MaxPool2d(2, 2))
 
-        self.blocks = nn.Sequential(*blocks)
+        self.encode = nn.Sequential(*blocks)
 
     def forward(self, input):
-        return self.blocks(input)
+        return self.encode(input)
 
 
 class Decoder(nn.Module):
-    def __init__(
-        self, in_channel, out_channel, channel, n_res_block, n_res_channel, stride
-    ):
+    def __init__(self, channel, out_channel, extra_layers, extra_residual_blocks, upsample):
         super().__init__()
 
-        blocks = [nn.Conv2d(in_channel, channel, 3, padding=1)]
+        blocks = []
 
-        for i in range(n_res_block):
-            blocks.append(ResBlock(channel, n_res_channel))
-
-        blocks.append(nn.ReLU(inplace=True))
-
-        if stride == 4:
-            blocks.extend(
-                [
-                    nn.ConvTranspose2d(channel, channel // 2, 4, stride=2, padding=1),
-                    nn.ReLU(inplace=True),
-                    nn.ConvTranspose2d(
-                        channel // 2, out_channel, 4, stride=2, padding=1
-                    ),
-                ]
-            )
-
-        elif stride == 2:
-            blocks.append(
-                nn.ConvTranspose2d(channel, out_channel, 4, stride=2, padding=1)
-            )
+        for i in range(extra_residual_blocks):
+            blocks.append(ResBlock(in_channel=channel, out_channel=channel, extra_layers=extra_layers, residual=True))
+            if (upsample=='Twice') & (i==0):
+                blocks.append(nn.ConvTranspose2d(channel, channel, 2, 2))
+                            
+        blocks.append(nn.ConvTranspose2d(channel, out_channel, 2, 2))
 
         self.blocks = nn.Sequential(*blocks)
 
@@ -147,38 +131,38 @@ class Decoder(nn.Module):
 
 
 class VQVAE(nn.Module):
+    '''
+    params: in_channel=3, channel=64, n_res_block=2, n_res_channel=32, embed_dim=64, n_embed=512, decay=0.99
+    '''
     def __init__(
         self,
         in_channel=3,
-        channel=128,
+        channel=64,
         n_res_block=2,
         n_res_channel=32,
-        embed_dim=64*2,
+        embed_dim=64,
         n_embed=512,
-        decay=0.99,
+        decay=0.99
     ):
+        '''
+        params: in_channel=3, channel=64, n_res_block=2, n_res_channel=32, embed_dim=64, n_embed=512, decay=0.99
+        '''
         super().__init__()
+        # Encoders, first one should have two rounds of downsampling, second should have one
+        self.enc_b = Encoder(in_channel=in_channel, channel=channel, extra_layers=2, stride=2, kernel_size=5, residual=False, extra_residual_blocks=2, downsample='Once')
+        self.enc_t = Encoder(in_channel=channel, channel=channel, extra_layers=3, stride=1, kernel_size=3, residual=False, extra_residual_blocks=2, downsample='Once')
 
-        self.enc_b = Encoder(in_channel, channel, n_res_block, n_res_channel, stride=4)
-        self.enc_t = Encoder(channel, channel, n_res_block, n_res_channel, stride=2)
         self.quantize_conv_t = nn.Conv2d(channel, embed_dim, 1)
         self.quantize_t = Quantize(embed_dim, n_embed)
-        self.dec_t = Decoder(
-            embed_dim, embed_dim, channel, n_res_block, n_res_channel, stride=2
-        )
+
+        # Decoders,
+#         self.dec_t = Decoder(embed_dim, embed_dim, channel, n_res_block, n_res_channel, stride=2)
+        self.dec_t = Decoder(embed_dim, embed_dim, channel, extra_residual_blocks = n_res_block, upsample='Once')
         self.quantize_conv_b = nn.Conv2d(embed_dim + channel, embed_dim, 1)
         self.quantize_b = Quantize(embed_dim, n_embed)
-        self.upsample_t = nn.ConvTranspose2d(
-            embed_dim, embed_dim, 4, stride=2, padding=1
-        )
-        self.dec = Decoder(
-            embed_dim + embed_dim,
-            in_channel,
-            channel,
-            n_res_block,
-            n_res_channel,
-            stride=4,
-        )
+        self.upsample_t = nn.ConvTranspose2d(embed_dim, embed_dim, 4, stride=2, padding=1)
+#         self.dec = Decoder(embed_dim + embed_dim, in_channel, channel, n_res_block, n_res_channel, stride=4)
+        self.dec = Decoder(embed_dim + embed_dim, in_channel, extra_layers=2, extra_residual_blocks=2, upsample='Twice')
 
     def forward(self, input):
         quant_t, quant_b, diff, _, _ = self.encode(input)
@@ -221,4 +205,16 @@ class VQVAE(nn.Module):
         dec = self.decode(quant_t, quant_b)
 
         return dec
+
+if __name__ == "__main__":
+    model = VQVAE().to('cuda:0')
+    summary(model, (3, 256, 256))
+    # model(torch.ones(1,3,256,256).to('cuda:0'))[0].shape
     
+    thing1 = Encoder(in_channel=3, channel=128, extra_layers=2, stride=2, kernel_size=5, residual=False, extra_residual_blocks=2, downsample='Once')
+    thing2 = Encoder(in_channel=thing1.out_channels, channel=64, extra_layers=3, stride=1, kernel_size=3, residual=False, extra_residual_blocks=2, downsample='Once')
+    thing3 = Decoder(64, 32, extra_layers=2, extra_residual_blocks=2, upsample='Twice')
+    
+    summary(thing1.to('cuda:0'), (3, 256, 256))
+    # summary(thing2.to('cuda:0'), (thing1.out_channels, 64, 64))
+    # summary(thing3.to('cuda:0'), (64, 32, 32))
