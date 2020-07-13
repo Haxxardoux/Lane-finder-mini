@@ -47,7 +47,7 @@ def train(epoch, loader, model, optimizer, device):
             )
         )
 
-        if i % 20 == 0:
+        if i % 100 == 0:
             model.eval()
 
             sample = img[:sample_size]
@@ -68,4 +68,76 @@ def train(epoch, loader, model, optimizer, device):
             }, 'run_stats.pyt')
             model.train()
 
-        yield {'Metric: Latent Loss':latent_loss.item(), 'Metric: Average MSE':mse_sum/mse_n, 'Metric: Reconstruction Loss':recon_loss.item(), 'Parameter: Parameters':params, 'Artifact':'run_stats.pyt'}
+        ret = {'Metric: Latent Loss':latent_loss.item(), 'Metric: Average MSE':mse_sum/mse_n, 'Metric: Reconstruction Loss':recon_loss.item(), 'Parameter: Parameters':params, 'Artifact':'run_stats.pyt'}
+        yield ret
+
+        
+def knowledge_distillation(epoch, loader, teacher_model, student_model, optimizer, device):
+    '''
+    epoch, loader, teacher_model, student_model, optimizer, device
+    '''
+    loader = tqdm(loader)
+
+    criterion = nn.MSELoss()
+    
+    mse_sum = 0
+    mse_n = 0
+    
+    t_params = count_parameters(teacher_model)
+    s_params = count_parameters(student_model)
+    
+    for i, (img, labels) in enumerate(loader):
+        teacher_model.zero_grad()
+        teacher_model.eval()
+        student_model.zero_grad()
+
+        img = img.to(device)
+
+        teacher_quant_t, teacher_quant_b, _, t_id_t, t_id_b = teacher_model.encode(img)
+        student_quant_t, student_quant_b, _, s_id_t, s_id_b = student_model.encode(img)
+
+        t_mse = criterion(student_quant_t, teacher_quant_t)
+        b_mse = criterion(student_quant_b, teacher_quant_b)
+
+        loss = t_mse + b_mse
+        loss.backward()
+
+        optimizer.step()
+
+        mse_sum += loss.item() * img.shape[0]
+        mse_n += img.shape[0]
+
+        lr = optimizer.param_groups[0]["lr"]
+
+        loader.set_description(
+            (
+                f"epoch: {epoch + 1}; avg mse: {mse_sum / mse_n:.5f}; "
+                f"lr: {lr:.5f}"
+            )
+        )
+
+        if i % 100 == 0:
+            student_model.eval()
+
+            sample_size = 10
+            sample = img[:sample_size]
+
+            with torch.no_grad():
+                out = teacher_model.decode(student_quant_t, student_quant_b)
+
+            utils.save_image(
+                torch.cat([sample, out], 0),
+                f"samples/{str(epoch + 1).zfill(5)}_{str(i).zfill(5)}.jpg",
+                nrow=sample_size,
+                normalize=True,
+                range=(-1, 1))
+
+            torch.save({
+            'model':student_model.state_dict(),
+            'optimizer':optimizer.state_dict(),
+            }, 'run_stats.pyt')
+
+            student_model.train()
+
+        ret = {'Metric: Average MSE':mse_sum/mse_n, 'Parameter: Student Parameters':s_params, 'Parameter: Teacher Parameters':t_params, 'Artifact':'run_stats.pyt'}
+        yield ret

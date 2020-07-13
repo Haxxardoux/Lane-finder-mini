@@ -1,0 +1,1 @@
+mlflow ui --port 6010 --backend-store-uri file:/share/lazy/will/ConstrastiveLoss/Logs &
