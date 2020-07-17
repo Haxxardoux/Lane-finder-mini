@@ -172,8 +172,8 @@ class VQVAE(nn.Module):
         n_res_block=2,
         n_extra_layers=2,
         n_res_channel=32,
-        embed_dim=64,
-        n_embed=512,
+        embed_dim=64//2,
+        n_embed=512//2,
         decay=0.99
     ):
         '''
@@ -192,7 +192,7 @@ class VQVAE(nn.Module):
         self.quantize_conv_b = nn.Conv2d(embed_dim + channel, embed_dim, 1)
         self.quantize_b = Quantize(embed_dim, n_embed)
         self.upsample_t = nn.ConvTranspose2d(embed_dim, embed_dim, 4, stride=2, padding=1)
-        self.dec = Decoder(embed_dim + embed_dim, in_channel, extra_layers=2, extra_residual_blocks=2, upsample='Twice')
+        self.dec = Decoder(embed_dim + embed_dim, in_channel, extra_layers=n_extra_layers+1, extra_residual_blocks=n_res_block+2, upsample='Twice')
 
     def forward(self, input):
         quant_t, quant_b, diff, _, _ = self.encode(input)

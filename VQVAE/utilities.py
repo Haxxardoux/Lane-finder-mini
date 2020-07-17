@@ -9,6 +9,7 @@ import os
 import lmdb
 import pickle
 from collections import namedtuple
+import sys
 
 def select_gpu(selection=None):
     """
@@ -59,8 +60,8 @@ def save_to_mlflow(stats_dict:dict, args):
     Example: {'Param: Parameters':106125, 'Metric: Training Loss':10.523}
     '''
     for key, value in stats_dict.items():
-        if 'Param: ' in key:
-            mlflow.log_param(key[7:], value)
+        if 'Parameter: ' in key:
+            mlflow.log_param(key[11:], value)
         if 'Metric: ' in key:
             mlflow.log_metric(key[8:], value)
         if 'Artifact' in key:
@@ -137,7 +138,17 @@ def load_full_state(model_to_update, optimizer_to_update, Path, freeze_weights=F
     print('we also froze {} weights'.format(ct))
     
     print('Of the '+str(len(model_to_update.state_dict())/2)+' parameter layers to update in the current model, '+str(len(update_dict)/2)+' were loaded')
-
+    
+def save_summary(model, sample_input):
+    # this part saves the printed output of summary() to a text file
+    orig_stdout = sys.stdout
+    f = open('model_summary.txt', 'w')
+    sys.stdout = f
+#     summary(model, sample_input.shape)
+    print(model)
+    sys.stdout = orig_stdout
+    f.close()
+    mlflow.log_artifact('model_summary.txt')
     
 class LMDBDataset(torch.utils.data.Dataset):
     CodeRow = namedtuple('CodeRow', ['top', 'bottom', 'filename'])
